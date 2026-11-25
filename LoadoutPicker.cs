@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Text;
 using GamesByMalcs.Melvor2;
 using GamesByMalcs.Melvor2.Components.Equipment;
+using GamesByMalcs.Melvor2.Core;
 using GamesByMalcs.Melvor2.Components.Inventories;
 using GamesByMalcs.Melvor2.Components.ItemEquipping;
 using GamesByMalcs.Melvor2.Components.Loadouts;
@@ -23,7 +24,6 @@ public class LoadoutPickerMod : IMod
 {
     const int nodeCheckInterval = 30;
     const string pickerName = "LoadoutPickerDropdown";
-    const string replaceLabelName = "LoadoutPickerReplaces";
     const BindingFlags privateInstance = BindingFlags.NonPublic | BindingFlags.Instance;
 
     static readonly PropertyInfo equipOptionsProp = typeof(SelectedItemView).GetProperty("EquipOptions", privateInstance);
@@ -33,7 +33,6 @@ public class LoadoutPickerMod : IMod
     static readonly PropertyInfo stackProp = typeof(EquipItemOptions).GetProperty("Stack", privateInstance);
     static readonly FieldInfo selectedEventField = typeof(EquipItemButton).GetField("Selected", privateInstance);
     static readonly PropertyInfo availableSlotProp = typeof(EquipItemButton).GetProperty("AvailableSlot", privateInstance);
-    static readonly PropertyInfo replacedContainerProp = typeof(EquipItemButton).GetProperty("ReplacedItemsContainer", privateInstance);
     static readonly PropertyInfo equipmentLoadoutsProp = typeof(EquipmentComponent).GetProperty("Loadouts", privateInstance);
 
     ModContext ctx;
@@ -56,7 +55,7 @@ public class LoadoutPickerMod : IMod
         beforeEquip = BeforeEquip;
         afterEquip = AfterEquip;
         if (new object[] { equipOptionsProp, viewStatsButtonProp, equipButtonContainerProp, itemEquippingProp, stackProp,
-                selectedEventField, availableSlotProp, replacedContainerProp, equipmentLoadoutsProp }.Any(m => m == null))
+                selectedEventField, availableSlotProp, equipmentLoadoutsProp }.Any(m => m == null))
         {
             ctx.Log("game internals changed, LoadoutPicker disabled");
             return;
@@ -304,9 +303,7 @@ public class LoadoutPickerMod : IMod
     void AfterEquip(object sender, SlotSelectedEventArgs e)
     {
         if (swappedFrom == null) return;
-        var name = loadouts.ActiveLoadouts.TryGetValue(target, out var t) ? t.Name : target.Id;
         SwapBack();
-        ctx.Log($"equipped into loadout {name}");
         pickerSignature = null;
     }
 
@@ -317,7 +314,34 @@ public class LoadoutPickerMod : IMod
         if (loadouts != null && back != null) loadouts.SwapToLoadout(back);
     }
 
-    // With a non-active loadout picked, each equip button shows what it replaces in that loadout.
+    // A slot of a stored (non-active) loadout, shaped so the game's ReplacedItemView can draw it.
+    sealed class StoredSlot : IActiveEquipmentSlot
+    {
+        public StoredSlot(EquipmentSlot slot, Vector2I gridPosition, EquipmentItem equipped, int quantity)
+        {
+            Slot = slot;
+            GridPosition = gridPosition;
+            Equipped = equipped;
+            Quantity = quantity;
+        }
+
+        public EquipmentSlot Slot { get; }
+        public Vector2I GridPosition { get; }
+        public EquipmentItem Equipped { get; }
+        public int Quantity { get; }
+        public bool IsOccupied => false;
+        public bool IsEmpty => Equipped == null;
+        public event EventHandler<ValueChangedEventArgs<EquipmentItem>> EquippedChanged { add { } remove { } }
+        public event EventHandler<ValueChangedEventArgs<int>> QuantityChanged { add { } remove { } }
+        public event EventHandler<ValueChangedEventArgs<bool>> IsOccupiedChanged { add { } remove { } }
+    }
+
+    // Bindings this mod gave to equip buttons, with the loadout they describe.
+    readonly Dictionary<AvailableEquipmentSlot, LoadoutSlot> ownBindings = new Dictionary<AvailableEquipmentSlot, LoadoutSlot>();
+
+    // With a non-active loadout picked, rebinds each equip button so the game's own
+    // "Will Replace" rows list that loadout's items. The game rebinds the buttons with
+    // active-loadout data on every equip or swap; the next frame rebinds them again.
     void UpdateReplaceLabels()
     {
         var container = equipButtonContainerProp.GetValue(equipOptions) as Node;
@@ -325,61 +349,71 @@ public class LoadoutPickerMod : IMod
         var stack = stackProp.GetValue(equipOptions) as IReadonlyItemStack;
         var equipping = itemEquippingProp.GetValue(equipOptions) as ItemEquippingComponent;
 
+        if (target == null || stack == null || equipping == null)
+        {
+            if (ownBindings.Count == 0) return;
+            bool anyOwn = container.GetChildren().OfType<EquipItemButton>()
+                .Any(b => availableSlotProp.GetValue(b) is AvailableEquipmentSlot a && ownBindings.ContainsKey(a));
+            ownBindings.Clear();
+            if (anyOwn) equipOptions.Update();
+            return;
+        }
+
         foreach (var child in container.GetChildren())
         {
             if (child is not EquipItemButton button) continue;
-            var gameReplaced = replacedContainerProp.GetValue(button) as Control;
-            if (gameReplaced == null) continue;
-            var parent = gameReplaced.GetParent();
-            var label = parent.GetNodeOrNull<Label>(replaceLabelName);
+            if (availableSlotProp.GetValue(button) is not AvailableEquipmentSlot available) continue;
+            if (ownBindings.TryGetValue(available, out var describes) && describes == target) continue;
 
-            bool showTarget = target != null && stack != null && equipping != null && gameReplaced.Visible | (label?.Visible ?? false);
-            if (!showTarget)
-            {
-                if (label != null && label.Visible)
-                {
-                    label.Visible = false;
-                    gameReplaced.Visible = true;
-                }
-                continue;
-            }
-
-            if (label == null)
-            {
-                label = new Label();
-                label.Name = replaceLabelName;
-                label.AutowrapMode = TextServer.AutowrapMode.WordSmart;
-                label.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
-                parent.AddChild(label);
-                parent.MoveChild(label, gameReplaced.GetIndex() + 1);
-            }
-            var available = availableSlotProp.GetValue(button) as AvailableEquipmentSlot;
-            label.Text = available == null ? "" : DescribeReplaced(equipping.Equipment, stack.Item, available.Slot.Slot);
-            gameReplaced.Visible = false;
-            label.Visible = true;
+            var replaces = StoredReplaces(equipping.Equipment, stack.Item, available.Slot.Slot);
+            var rebound = new AvailableEquipmentSlot(available.Slot, replaces);
+            ownBindings.Remove(available);
+            ownBindings[rebound] = target;
+            button.Unbind();
+            button.Bind(rebound);
         }
+        if (ownBindings.Count > 32) ownBindings.Clear();
     }
 
-    string DescribeReplaced(EquipmentComponent equipment, Item item, EquipmentSlot slot)
+    // Same rules as EquipmentComponent.GetReplacedSlotsOnEquip, read from the stored loadout.
+    List<IActiveEquipmentSlot> StoredReplaces(EquipmentComponent equipment, Item item, EquipmentSlot slot)
     {
-        string loadoutName = loadouts.ActiveLoadouts.TryGetValue(target, out var t) ? t.Name : target.Id;
-        var slots = new List<EquipmentSlot> { slot };
-        if (item.Capabilities.TryGet<EquipmentCapability>(out var cap) && cap.OccupiesSlots != null)
-            slots.AddRange(cap.OccupiesSlots);
+        var result = new List<IActiveEquipmentSlot>();
+        if (equipmentLoadoutsProp.GetValue(equipment) is not IDictionary stored
+            || !stored.Contains(target) || stored[target] is not EquipmentLoadout saved)
+            return result;
 
-        var names = new List<string>();
-        var stored = equipmentLoadoutsProp.GetValue(equipment) as IDictionary;
-        if (stored != null && stored.Contains(target) && stored[target] is EquipmentLoadout saved)
+        var added = new HashSet<EquipmentSlot>();
+        void AddHolderOf(EquipmentSlot s)
         {
-            foreach (var s in slots)
+            if (!saved.Slots.TryGetValue(s, out var entry) || entry.Equipped == null) return;
+            var holder = s;
+            var holderEntry = entry;
+            if (entry.IsOccupied)
             {
-                if (!saved.Slots.TryGetValue(s, out var slotLoadout) || slotLoadout.Equipped == null) continue;
-                if (slotLoadout.Equipped.Item == item) continue;
-                string n = slotLoadout.Equipped.Item.DisplayName.GetPluralText(1);
-                if (!names.Contains(n)) names.Add(n);
+                var owner = saved.Slots.FirstOrDefault(kv => !kv.Value.IsOccupied && kv.Value.Equipped?.Item == entry.Equipped.Item);
+                if (owner.Value == null) return;
+                holder = owner.Key;
+                holderEntry = owner.Value;
             }
+            if (!added.Add(holder)) return;
+            var grid = equipment.TryGetActiveSlot(holder, out var active) ? active.GridPosition : Vector2I.Zero;
+            result.Add(new StoredSlot(holder, grid, holderEntry.Equipped, holderEntry.Quantity));
         }
-        string replaces = names.Count == 0 ? "nothing" : string.Join(", ", names);
-        return $"In {loadoutName}, replaces: {replaces}";
+
+        AddHolderOf(slot);
+        if (item.Capabilities.TryGet<EquipmentCapability>(out var cap))
+        {
+            if (cap.OccupiesSlots != null)
+                foreach (var s in cap.OccupiesSlots) AddHolderOf(s);
+            if (cap.AmmoType != null)
+                foreach (var kv in saved.Slots)
+                    if (!kv.Value.IsOccupied && kv.Value.Equipped?.Equipment.AmmoType == cap.AmmoType) AddHolderOf(kv.Key);
+        }
+        if (item.Capabilities.Contains<WeaponCapability>())
+            foreach (var kv in saved.Slots)
+                if (!kv.Value.IsOccupied && kv.Value.Equipped != null && kv.Value.Equipped.Item.Capabilities.Contains<WeaponCapability>())
+                    AddHolderOf(kv.Key);
+        return result;
     }
 }

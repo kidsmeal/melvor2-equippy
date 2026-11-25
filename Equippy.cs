@@ -16,14 +16,14 @@ using GamesByMalcs.Melvor2.Entities.Combat;
 using Godot;
 using MelvorModLoader;
 
-namespace LoadoutPicker;
+namespace Equippy;
 
 // Adds a loadout dropdown to the bank's Equip Item panel.
 // Equipping with a non-active loadout picked swaps to it, runs the game's own equip, then swaps back.
-public class LoadoutPickerMod : IMod
+public class EquippyMod : IMod
 {
     const int nodeCheckInterval = 30;
-    const string pickerName = "LoadoutPickerDropdown";
+    const string pickerName = "EquippyDropdown";
     const BindingFlags privateInstance = BindingFlags.NonPublic | BindingFlags.Instance;
 
     static readonly PropertyInfo equipOptionsProp = typeof(SelectedItemView).GetProperty("EquipOptions", privateInstance);
@@ -57,7 +57,7 @@ public class LoadoutPickerMod : IMod
         if (new object[] { equipOptionsProp, viewStatsButtonProp, equipButtonContainerProp, itemEquippingProp, stackProp,
                 selectedEventField, availableSlotProp, equipmentLoadoutsProp }.Any(m => m == null))
         {
-            ctx.Log("game internals changed, LoadoutPicker disabled");
+            ctx.Log("game internals changed, Equippy disabled");
             return;
         }
         ctx.Frame += Update;

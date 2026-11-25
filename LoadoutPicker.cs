@@ -183,6 +183,7 @@ public class LoadoutPickerMod : IMod
         header.Pressed += ToggleList;
 
         listPopup = new PopupPanel();
+        listPopup.PopupHide += () => listHiddenAt = Time.GetTicksMsec();
         var listStyle = LoadStyle(listStylePath, 6, 6, 6, 6);
         if (listStyle != null) listPopup.AddThemeStyleboxOverride("panel", listStyle);
         listRows = new VBoxContainer();
@@ -196,6 +197,11 @@ public class LoadoutPickerMod : IMod
         pickerSignature = null;
     }
 
+    // A click on the header while the list is open closes the list on mouse down,
+    // then fires Pressed on mouse up. Ignoring Pressed right after a close stops the reopen.
+    const ulong reopenGuardMs = 250;
+    ulong listHiddenAt;
+
     void ToggleList()
     {
         if (listPopup.Visible)
@@ -203,6 +209,7 @@ public class LoadoutPickerMod : IMod
             listPopup.Hide();
             return;
         }
+        if (Time.GetTicksMsec() - listHiddenAt < reopenGuardMs) return;
         float scale = header.GetGlobalTransform().Scale.Y;
         var position = header.GetScreenPosition() + new Vector2(0, header.Size.Y * scale);
         listPopup.Popup(new Rect2I((Vector2I)position, new Vector2I((int)(header.Size.X * scale), 0)));
